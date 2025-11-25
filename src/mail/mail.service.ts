@@ -51,129 +51,105 @@
 // }
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { ImapFlow, ListResponse } from 'imapflow';
+import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 
 @Injectable()
 export class MailService implements OnModuleInit {
-  private client: ImapFlow;
+  private inboxClient: ImapFlow;
+  private sentClient: ImapFlow;
 
   constructor(private config: ConfigService) {
-    this.client = new ImapFlow({
-      host: this.config.get<string>('IMAP_HOST')!,
+    // 1️⃣ INBOX CLIENT
+    this.inboxClient = new ImapFlow({
+      host: this.config.get('IMAP_HOST')!,
       port: 993,
       secure: true,
       auth: {
-        user: this.config.get<string>('CLIENT_EMAIL')!,
-        pass: this.config.get<string>('CLIENT_PASSWORD')!,
+        user: this.config.get('CLIENT_EMAIL')!,
+        pass: this.config.get('CLIENT_PASSWORD'),
+      },
+    });
+
+    // 2️⃣ SENT MAIL CLIENT (separate connection)
+    this.sentClient = new ImapFlow({
+      host: this.config.get('IMAP_HOST')!,
+      port: 993,
+      secure: true,
+      auth: {
+        user: this.config.get('CLIENT_EMAIL')!,
+        pass: this.config.get('CLIENT_PASSWORD'),
       },
     });
   }
 
   async onModuleInit() {
-    await this.client.connect();
-    console.log('📡 Connected to IMAP Server');
-
-    // Show all mailboxes
-    await this.listMailboxes();
-
-    // Start listeners
-    this.listenInbox();
-    this.listenSent();
+    await this.startInboxListener();
+    await this.startSentListener();
   }
 
-  // ---------------------------------------------------------------------
-  // 📂 LIST AVAILABLE MAILBOXES
-  // ---------------------------------------------------------------------
-  private async listMailboxes() {
-    console.log('📂 Mailboxes:');
+  // 📥 LISTEN INCOMING
+  private async startInboxListener() {
+    await this.inboxClient.connect();
+    await this.inboxClient.mailboxOpen('INBOX');
 
-    const list: ListResponse[] = await this.client.list();
-    for (const box of list) {
-      console.log(' →', box.path);
-    }
-  }
+    console.log('📥 INBOX Listener Active');
 
-  // ---------------------------------------------------------------------
-  // 📌 Detect Gmail “Sent Mail” folder
-  // ---------------------------------------------------------------------
-  private async findSentFolder(): Promise<string | null> {
-    const possibleNames = [
-      '[Gmail]/Sent Mail',
-      '[Gmail]/Sent',
-      'Sent',
-      'Sent Mail',
-      'Sent Items',
-      'Sent Messages',
-      'OUTBOX',
-      'Outbox',
-    ];
+    this.inboxClient.on('exists', async () => {
+      const msg = await this.inboxClient.fetchOne('*', { source: true });
+      if (!msg) return;
 
-    const list: ListResponse[] = await this.client.list();
+      const parsed = await simpleParser(msg.source);
 
-    for (const box of list) {
-      if (possibleNames.includes(box.path)) {
-        console.log('📌 Sent folder detected:', box.path);
-        return box.path;
-      }
-    }
-
-    console.log('⚠ No sent folder detected');
-    return null;
-  }
-
-  // ---------------------------------------------------------------------
-  // 📥 LISTEN TO INCOMING EMAILS
-  // ---------------------------------------------------------------------
-  private async listenInbox() {
-    await this.client.mailboxOpen('INBOX');
-
-    console.log('📥 INBOX Listener active...');
-
-    this.client.on('exists', async () => {
-      const message = await this.client.fetchOne('*', { source: true });
-      if (!message) return;
-
-      const parsed = await simpleParser(message.source);
-
-      console.log('📩 Incoming Email:', {
-        from: parsed.from?.text,
-        subject: parsed.subject,
-      });
-
-      // Save to DB here
-      // await EmailModel.create({...})
+      console.log('📩 Incoming Email:', parsed.subject);
     });
   }
 
-  // ---------------------------------------------------------------------
-  // 📤 LISTEN TO OUTGOING (“SENT”) EMAILS
-  // ---------------------------------------------------------------------
-  private async listenSent() {
-    const sentFolder = await this.findSentFolder();
+  // 📤 LISTEN SENT MAIL
+  private async startSentListener() {
+    await this.sentClient.connect();
+
+    const sentFolder = await this.findSentFolder(this.sentClient);
 
     if (!sentFolder) {
-      console.log('⚠ Cannot start Sent Mail listener — folder not found');
+      console.log('⚠ No Sent Folder Found');
       return;
     }
 
-    await this.client.mailboxOpen(sentFolder);
+    await this.sentClient.mailboxOpen(sentFolder);
 
-    console.log('📤 SENT MAIL Listener active...');
+    console.log('📤 SENT MAIL Listener Active:', sentFolder);
 
-    this.client.on('exists', async () => {
-      const message = await this.client.fetchOne('*', { source: true });
-      if (!message) return;
+    this.sentClient.on('exists', async () => {
+      const msg = await this.sentClient.fetchOne('*', { source: true });
+      if (!msg) return;
 
-      const parsed = await simpleParser(message.source);
+      const parsed = await simpleParser(msg.source);
 
-      console.log('📤 Sent Email:', {
-        to: parsed.to?.text,
-        subject: parsed.subject,
-      });
-
-      // Save to DB
-      // await EmailModel.create({...})
+      console.log('📤 Sent Email:', parsed.subject);
     });
+  }
+
+  // 🔍 AUTO-DETECT SENT FOLDER
+  private async findSentFolder(client: ImapFlow) {
+    const boxes = await client.list();
+    const names = boxes.map(b => b.path.toLowerCase());
+
+    const possible = [
+      '[gmail]/sent mail',
+      '[gmail]/sent',
+      'sent',
+      'sent items',
+      'sent messages',
+      'inbox.sent',
+      'inbox.sent items',
+    ];
+
+    for (const name of possible) {
+      const match = boxes.find(b => b.path.toLowerCase() === name);
+      if (match) return match.path;
+    }
+
+    return null;
   }
 }
